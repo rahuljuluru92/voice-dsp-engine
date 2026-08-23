@@ -138,6 +138,30 @@ Test suite (`tests/test_formant.py`) uses 2.0Hz F0 tolerance and 60Hz peak-locat
 
 ---
 
+### 2026-08-23 — Live engine architecture: chunked worker thread, not inline per-callback DSP
+
+**Decision:** The PortAudio callback (`VoiceEngine.audio_callback`) does not run the phase-vocoder/formant/chain DSP directly. It only accumulates incoming audio into fixed-size chunks (`chunk_size`, default 4096 samples), pushes full chunks to the Stage 5 bounded input queue, and pulls already-processed audio out of an internal leftover buffer fed by the bounded output queue — emitting silence for any frames not yet available. A background worker thread pulls chunks from the input queue, runs the existing whole-chunk `formant.process()` + `SignalChain.process()` pipeline through the Stage 5 `BypassGuard`, and pushes results to the output queue.
+
+**Why:** The pitch/formant DSP (Stage 2/3) operates on whole arrays via STFT with frame-size zero-padding, and is too heavy (multiple FFTs per call) to run synchronously inside a real-time audio callback without risking callback overruns. Routing it through a producer/consumer queue plus worker thread is also the only architecture in which the Stage 5 bounded drop-oldest queues do anything meaningful — a queue only matters if there's a boundary between a real-time producer and a possibly-slower consumer, which this design creates by construction, and it's why Stage 5 (queues) is a real prerequisite for Stage 6 rather than an unrelated add-on.
+
+**Known tradeoff — chunk-boundary discontinuity:** Because each `chunk_size` chunk is passed through `formant.process()` independently (its own zero-padding, its own phase-vocoder phase accumulation starting fresh each call), phase continuity is not maintained across chunk boundaries. This can produce an audible discontinuity/click at each chunk edge (every ~85ms at the default chunk_size=4096, sr=48000) that a fully sample-accurate streaming phase vocoder (maintaining running phase state across the whole session) would not have. This was a deliberate scope tradeoff given implementation time; a continuous-phase streaming vocoder is a larger undertaking and is recorded under "Considered but out of scope" below.
+
+**Known tradeoff — added latency:** Total round-trip latency is at minimum roughly one `chunk_size` (audio must fully arrive before the worker can process it) plus processing time plus PortAudio's own reported I/O latency, i.e. on the order of 100-200ms at the defaults — higher than Stage 1's raw passthrough latency. This is an inherent cost of the STFT-based approach combined with the chunk/queue safety architecture, not a bug.
+
+**Measured behavior (2026-08-23):** fed 300 synthetic 256-sample blocks (76,800 samples, ~1.6s at 48kHz) of a 220Hz test tone through `VoiceEngine.audio_callback` directly (no real hardware) with the identity preset: 72,192 of 76,800 output frames (94%) carried real processed audio, the rest being the expected startup silence before the first chunk was buffered/processed; output stayed fully finite, bounded to the 0.98 limiter threshold, with zero bypasses and zero queue drops under this load.
+
+**Alternatives considered:** Fully sample-accurate streaming phase vocoder maintaining continuous per-bin synthesis phase across the whole session — would eliminate the chunk-boundary artifact and reduce latency, but is substantially more implementation and testing surface; noted under "Considered but out of scope."
+
+**Stage:** Integration (between Stage 5 and Stage 6).
+
+---
+
+### 2026-08-23 — Considered but out of scope
+
+- **Fully continuous-phase streaming phase vocoder** (incremental STFT with a persistent per-bin synthesis-phase accumulator across the whole session, rather than independent per-chunk processing) — would remove the chunk-boundary discontinuity described above and reduce latency. Left as a documented future improvement rather than implemented now, per the chunked-worker-thread tradeoff above.
+
+---
+
 ### 2026-08-23 — Pitch shift algorithm
 
 **Decision:** Implement pitch shifting as phase-vocoder time-stretch (with true instantaneous-frequency phase reconstruction: measured phase deviation from each bin's expected phase advance, unwrapped, used to compute the bin's true instantaneous frequency, which drives the synthesis phase accumulation) followed by linear-interpolation resampling to restore original duration.
