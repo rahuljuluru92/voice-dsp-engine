@@ -75,6 +75,27 @@ back to the original.
 
 ---
 
+### 2026-08-23 — Cepstral formant envelope extraction and warping
+
+**Decision:** Extract the spectral envelope per STFT frame via real-cepstrum liftering (log-magnitude -> irfft -> zero out quefrency indices [cutoff, frame_size-cutoff) -> rfft back), with cutoff_quefrency = frame_size // 16 (128 samples at frame_size=2048). Warp the envelope along frequency by linear interpolation of bin index (new_envelope(f) = old_envelope(f / warp_ratio)). Formant-only shifting flattens the original spectrum by the envelope (excitation = magnitude / envelope), warps the envelope, and re-multiplies, keeping original phase untouched (no time-stretching involved). Pitch-only shifting composes the Stage 2 phase-vocoder pitch shift with an inverse formant warp (formant_semitones = -pitch_semitones) to cancel the frequency-axis scaling that resampling otherwise imposes on the envelope.
+
+**Why:** Cepstral liftering is the standard technique for separating the slowly-varying spectral envelope (formants, low quefrency) from pitch-periodicity structure (high quefrency), and does so without requiring LPC coefficient estimation. cutoff_quefrency = frame_size/16 was chosen empirically: it needs to be well below the period (in samples) of the lowest expected F0 in this project's use case (target ~80-300Hz voice) so it doesn't leak harmonic structure into the envelope estimate, while still being large enough to resolve two closely-spaced formants (~500Hz apart). Verified with an isolated synthetic-envelope unit check (single Gaussian peak at 700Hz warped by 2^(4/12): expected new peak 881.9Hz, measured 890.6Hz — within one FFT bin) that the warp math itself is correct, separately from cepstral-estimation noise.
+
+**Measured accuracy (2026-08-23)**, synthetic two-formant vowel (F0=180Hz, formants at 700Hz/60Hz-bw and 1200Hz/70Hz-bw, sr=48000, frame_size=2048, bin width 23.4Hz):
+- Formant-only shift (+4, -3 semitones): F0 unchanged exactly (0Hz measured difference) in both cases.
+- Formant-only shift (+4 semitones): peaks measured [937.5, 1500.0]Hz vs. expected [915.4, 1506.0]Hz — errors 22.1Hz, 6.0Hz.
+- Formant-only shift (-3 semitones): peaks measured [632.8, 1007.8]Hz vs. expected [611.0, 1005.1]Hz — errors 21.8Hz, 2.7Hz.
+- Pitch-only (formant-preserving) shift (+5 semitones): F0 measured 240.0Hz vs. expected 240.27Hz (0.27Hz error); formant peaks measured [750.0, 1148.4]Hz vs. original [726.6, 1195.3]Hz — errors 23.4Hz, 46.9Hz (worst case observed).
+- Pitch-only (formant-preserving) shift (-4 semitones): F0 measured 142.857Hz vs. expected 142.87Hz (0.01Hz error); formant peaks matched original exactly (0Hz difference).
+
+Test suite (`tests/test_formant.py`) uses 2.0Hz F0 tolerance and 60Hz peak-location tolerance, both with margin above the worst measured cases above while still catching an inverted/missing warp (which would misplace peaks by hundreds of Hz or shift F0 when it shouldn't).
+
+**Alternatives considered:** LPC-based envelope estimation — rejected as a heavier dependency/implementation for no clear accuracy benefit at this stage; cepstral liftering is explicitly what the project scope specifies.
+
+**Stage:** Stage 3.
+
+---
+
 ### 2026-08-23 — Pitch shift algorithm
 
 **Decision:** Implement pitch shifting as phase-vocoder time-stretch (with true instantaneous-frequency phase reconstruction: measured phase deviation from each bin's expected phase advance, unwrapped, used to compute the bin's true instantaneous frequency, which drives the synthesis phase accumulation) followed by linear-interpolation resampling to restore original duration.
