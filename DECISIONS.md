@@ -124,6 +124,20 @@ Test suite (`tests/test_formant.py`) uses 2.0Hz F0 tolerance and 60Hz peak-locat
 
 ---
 
+### 2026-08-23 — Bounded queue and bypass guard design
+
+**Decision:** Implement the bounded runtime queue as a thin thread-safe wrapper (`threading.Lock`) around `collections.deque(maxlen=capacity)` — `deque`'s built-in `maxlen` behavior already discards the oldest item automatically when a new one is appended at capacity, which is exactly drop-oldest semantics. Implement the bypass guard as a `BypassGuard.safe_process()` wrapper that catches any exception from the processing callable, checks output for non-finite values, and (optionally) enforces a wall-clock processing deadline — returning `np.zeros_like(x)` (silence) instead of the raw input in every failure case.
+
+**Why:** `deque(maxlen=...)` gives drop-oldest for free and is implemented in C, avoiding a hand-rolled ring buffer with more bug surface for the same guarantee. Returning silence rather than re-emitting the raw input `x` on any failure path (exception, non-finite output, or deadline overrun) is what the spec requires — bypass must never pass raw mic audio through unprocessed.
+
+**Measured behavior (2026-08-23):** fed a capacity-8 queue 1000 items while draining roughly every third `put()` — length never exceeded 8 at any point (asserted after every put). Fed a capacity-4 queue 10 items with no draining — queue retained items [6,7,8,9] (the four newest), reported `dropped_count == 6`, confirming oldest-first eviction. `BypassGuard`: a deliberately raising processing function produced all-zero output (not equal to input) with `bypass_count` incremented; a function returning a NaN triggered the same; a function sleeping 20ms against a 5ms deadline triggered the same; a healthy doubling function passed its real output through unchanged with `bypass_count == 0`.
+
+**Alternatives considered:** `queue.Queue` with a manual drop-oldest `put_nowait`/`get_nowait` retry loop — rejected as more code for an equivalent guarantee `deque(maxlen=...)` already provides.
+
+**Stage:** Stage 5.
+
+---
+
 ### 2026-08-23 — Pitch shift algorithm
 
 **Decision:** Implement pitch shifting as phase-vocoder time-stretch (with true instantaneous-frequency phase reconstruction: measured phase deviation from each bin's expected phase advance, unwrapped, used to compute the bin's true instantaneous frequency, which drives the synthesis phase accumulation) followed by linear-interpolation resampling to restore original duration.
