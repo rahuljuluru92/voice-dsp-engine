@@ -48,7 +48,6 @@ class VoiceEngine:
         limiter_threshold: float = 0.98,
         queue_capacity: int = 4,
         max_process_seconds: float | None = 1.0,
-        crossfade_samples: int = 240,
     ):
         self.sr = sr
         self.chunk_size = chunk_size
@@ -56,7 +55,6 @@ class VoiceEngine:
         self.analysis_hop = analysis_hop
         self.pitch_semitones = pitch_semitones
         self.formant_semitones = formant_semitones
-        self.crossfade_samples = crossfade_samples
 
         self.chain = SignalChain(
             sr=sr,
@@ -70,12 +68,9 @@ class VoiceEngine:
 
         self._input_accum = np.zeros(0, dtype=np.float64)
         self._output_leftover = np.zeros(0, dtype=np.float64)
-        self._held_tail: np.ndarray | None = None
         self.underrun_count = 0
         self.underrun_samples = 0
         self.callback_count = 0
-        self._crossfade_in = 0.5 - 0.5 * np.cos(np.linspace(0, np.pi, crossfade_samples)) \
-            if crossfade_samples > 0 else np.zeros(0)
         self._stop_event = threading.Event()
         self._worker_thread: threading.Thread | None = None
 
@@ -89,46 +84,26 @@ class VoiceEngine:
         )
         return self.chain.process(y)
 
-    def _crossfade_and_hold(self, processed: np.ndarray) -> np.ndarray:
-        """Smooth the chunk-boundary discontinuity documented in
-        DECISIONS.md: each chunk is DSP-processed independently, so
-        consecutive chunks' outputs don't connect smoothly. Rather than
-        splicing chunk N directly to chunk N+1, hold back the last
-        `crossfade_samples` of each processed chunk and blend them with
-        the start of the next one using a raised-cosine ramp, emitting
-        the blended segment in place of a hard join. Adds
-        crossfade_samples of latency (default 240 samples = 5ms at
-        48kHz) but replaces an audible click with a smooth transition.
-        """
-        n = self.crossfade_samples
-        if n <= 0 or len(processed) <= n:
-            return processed
-
-        if self._held_tail is None:
-            emit = processed[:-n]
-        else:
-            fade_in = self._crossfade_in
-            fade_out = 1.0 - fade_in
-            blended = self._held_tail * fade_out + processed[:n] * fade_in
-            emit = np.concatenate([blended, processed[n:-n]])
-
-        self._held_tail = processed[-n:].copy()
-        return emit
-
     def _worker_loop(self) -> None:
+        # NOTE: an earlier version of this method held back and
+        # cross-faded the tail of each processed chunk into the next
+        # one, aiming to smooth the chunk-boundary discontinuity
+        # documented below. That was reverted (2026-08-23): chunk N and
+        # chunk N+1 do not share any overlapping input time, so blending
+        # them into one shorter segment silently discarded real audio
+        # every cycle rather than smoothing anything -- confirmed live
+        # (an accumulating output deficit matching the crossfade width
+        # times the number of chunks processed). See DECISIONS.md.
         while not self._stop_event.is_set():
             chunk = self.input_queue.get()
             if chunk is None:
                 time.sleep(0.001)
                 continue
             processed = self.guard.safe_process(chunk)
-            emit = self._crossfade_and_hold(processed)
-            if len(emit):
-                self.output_queue.put(emit)
+            self.output_queue.put(processed)
 
     def start(self) -> None:
         self._stop_event.clear()
-        self._held_tail = None
         self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker_thread.start()
 
@@ -137,11 +112,6 @@ class VoiceEngine:
         if self._worker_thread is not None:
             self._worker_thread.join(timeout=2.0)
             self._worker_thread = None
-        # Safe to touch _held_tail now that the worker thread (the only
-        # other writer) has fully exited.
-        if self._held_tail is not None and len(self._held_tail):
-            self.output_queue.put(self._held_tail)
-            self._held_tail = None
 
     def _pull_output(self, n_needed: int) -> np.ndarray:
         while len(self._output_leftover) < n_needed:

@@ -210,9 +210,26 @@ Test suite (`tests/test_formant.py`) uses 2.0Hz F0 tolerance and 60Hz peak-locat
 
 ---
 
+### 2026-08-23 — Crossfade fix reverted: it discarded real audio rather than smoothing a click
+
+**What happened:** A raised-cosine crossfade was added to `VoiceEngine` to smooth the chunk-boundary discontinuity (previous entry). Isolated (non-live) testing showed it reduced discontinuity magnitude. Live hardware testing (project owner, headphones) reported the audible click was unchanged. New diagnostics were added (`underrun_count`/`underrun_samples`/`callback_count` on `VoiceEngine`, cheap integer counters only, no I/O on the real-time thread) and a live run showed: `callback_count=5642`, `underrun_count=368`, `underrun_samples=88608` (1846ms of inserted silence) over a 30-second run — i.e. the callback was padding with silence roughly once per chunk cycle (~351 chunk cycles expected in 30s at 85.33ms/chunk, closely matching 368 underrun events).
+
+**Root cause:** the crossfade implementation held back `crossfade_samples` (240) from each processed chunk and blended it into the *next* chunk's head to smooth the transition. But consecutive chunks are independent, non-overlapping segments of input audio -- chunk N and chunk N+1 do not represent overlapping time. Blending them into a single 240-sample output segment did not merge duplicate content (there was none); it silently discarded ~240 samples' worth of unique audio every chunk cycle. Over ~351 chunks in 30s, the arithmetic (351 x 240 = 84,240 samples) closely matches the measured 88,608 underrun samples -- the engine was structurally falling behind real-time by the crossfade width every cycle, and the underruns were it catching up by inserting silence.
+
+**Decision:** reverted the crossfade entirely (removed `_crossfade_and_hold`, `crossfade_samples`, and related state from `VoiceEngine`). Kept the new underrun diagnostics (`underrun_count`, `underrun_samples`, `callback_count`), which were essential to finding this and remain valuable for any future live debugging.
+
+**Verified after revert (2026-08-23, isolated synthetic test, real-time-paced):** 5-second run, 937 callbacks, only 17 underrun events totaling 90.67ms. Per-callback tracing showed 15 of those 17 were callbacks 0-15 (the first ~85ms) -- the expected, unavoidable one-time startup delay before the first chunk can be processed (already documented as an architecture tradeoff). Only 3 isolated underrun events in the remaining ~4.9 seconds -- occasional scheduling jitter, not a systemic problem. This is a dramatic improvement over the crossfade version's 368 underruns/30s, and confirms the crossfade bug was the dominant cause of the audible problem, not primarily the smaller phase-discontinuity artifact it was originally meant to address.
+
+**A correct fix for the original (smaller) phase-discontinuity click, if pursued later**, would need to process genuinely *overlapping* windows of input (each worker iteration reprocessing some of the previous chunk's trailing input samples, the way traditional STFT overlap-add works) so there is real shared content to blend -- not just cross-fade the outputs of disjoint chunks. Not implemented; recorded under "Considered but out of scope" below.
+
+**Stage:** Integration / live testing.
+
+---
+
 ### 2026-08-23 — Considered but out of scope
 
 - **Fully continuous-phase streaming phase vocoder** (incremental STFT with a persistent per-bin synthesis-phase accumulator across the whole session, rather than independent per-chunk processing) — would remove the chunk-boundary discontinuity described above and reduce latency. Left as a documented future improvement rather than implemented now, per the chunked-worker-thread tradeoff above.
+- **Overlapping-window chunk processing** to properly smooth the chunk-boundary phase discontinuity (see the crossfade-revert entry above for why a simple output-side crossfade doesn't work) -- would need real shared content between consecutive processing windows to blend correctly, not just independent chunks' outputs.
 - **Robust formant-envelope correction for non-harmonic (e.g. pure-tone) input** — the cepstral source-filter separation `pitch_shift_formant_preserving` relies on is not well-defined for signals without real harmonic structure (see the Stage 6 benchmark-debugging entry above). A more robust approach (e.g. detecting spectral sparsity/harmonicity and reducing or skipping the envelope correction accordingly) was not implemented, since real voice input is always harmonically rich and this only manifests on synthetic pure-tone test signals, not the engine's actual use case.
 
 ---
