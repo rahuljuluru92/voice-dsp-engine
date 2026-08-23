@@ -142,6 +142,15 @@ class VoiceEngine:
                     while True:
                         time.sleep(0.1)
                 else:
+                    # Deliberately silent during the run: unlike the
+                    # zero-DSP Stage 1 passthrough, this callback and its
+                    # worker thread are doing real FFT-based work with
+                    # much less slack per block, and periodic print()
+                    # calls from the main thread were confirmed (via
+                    # live testing) to cause audible clicks by briefly
+                    # holding the GIL at the wrong moment. Progress here
+                    # is "are you hearing your voice shifted correctly",
+                    # not a printed counter.
                     time.sleep(duration)
         finally:
             self.stop()

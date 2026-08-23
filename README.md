@@ -142,13 +142,11 @@ frequencies): 24/24 within the 3.0Hz tolerance. Worst-case error +0.3141Hz
 (`formant_down` preset, 180Hz base). Re-run `python3 -m validation.benchmark`
 to reproduce.
 
-**Stage 1 — live passthrough latency**: the callback logic was verified
-against 200 synthetic input buffers (correct passthrough, no exceptions,
-sub-millisecond compute time). The live 30-second hardware run with real
-microphone/speaker latency numbers was deferred to the project owner to
-avoid an unsupervised mic-to-speaker feedback loop — see `ASSUMPTIONS.md`
-for why, and update this section with real measured latency once that run
-happens.
+**Stage 1 — live passthrough latency**: run live for the full 30 seconds on
+real hardware (MacBook Air built-in microphone/speakers): 5670 callbacks,
+1,451,520 frames processed, reported input latency 227.021ms, reported
+output latency 31.854ms, mean callback compute time 2.5us, max 22.1us, 0
+underflows, 0 overflows.
 
 ## Known limitations
 
