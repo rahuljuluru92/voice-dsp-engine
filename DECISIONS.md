@@ -96,6 +96,34 @@ Test suite (`tests/test_formant.py`) uses 2.0Hz F0 tolerance and 60Hz peak-locat
 
 ---
 
+### 2026-08-23 — Biquad high-pass filter design and chain order
+
+**Decision:** Implement the high-pass filter as an RBJ Audio EQ Cookbook biquad (cutoff=80Hz default, Q=0.707) computed as (b0,b1,b2,a1,a2) coefficients, applied per block via `scipy.signal.lfilter` with filter state (`zi`) carried across calls so streaming blocks match a single whole-signal call. Signal chain order: high-pass filter -> noise gate -> limiter.
+
+**Why:** RBJ cookbook formulas are a standard, well-documented closed-form biquad design (no iterative fitting needed) and Q=0.707 gives a maximally-flat (Butterworth-equivalent) single-biquad rolloff. `lfilter` with `zi` state gives numerically-correct block-wise streaming (verified below) without hand-rolling a slower direct-form loop. Filter-then-gate-then-limiter ordering matches how a live vocal chain is conventionally ordered: remove rumble/DC before the gate makes its (level-based) mute decision, then limit after everything else so nothing downstream of the limiter can push levels back out of bounds.
+
+**Measured response (2026-08-23)**, cutoff=80Hz, Q=0.707, sr=48000: 20Hz: -24.100dB, 40Hz: -12.305dB, 80Hz: -3.012dB (matches the analytically expected -3.01dB at a biquad's corner frequency), 160Hz: -0.264dB, 500Hz: -0.003dB, 1000Hz/5000Hz: ~0.000dB. Block-wise streaming (256-sample chunks) vs. a single whole-array call matched within 1e-10 (float64 numerical noise floor).
+
+**Alternatives considered:** `scipy.signal.butter` — rejected; the project specifies a biquad filter with known/derivable coefficients rather than an opaque library-designed filter, and RBJ cookbook coefficients are directly checkable against the analytic -3.01dB-at-cutoff reference.
+
+**Stage:** Stage 4.
+
+---
+
+### 2026-08-23 — Noise gate and limiter design
+
+**Decision:** Both implemented as streaming, per-sample smoothed-gain processors with independent attack/release time constants (`exp(-1/(time_s*sr))` one-pole coefficients). Noise gate: envelope follower on `abs(x)`, binary target gain (1.0 above threshold, 0.0 below) smoothed by the same attack/release mechanism to avoid clicks. Limiter: per-sample desired gain = `min(1, threshold/|x|)`, smoothed toward with attack/release, followed by an *unconditional* hard `np.clip(y, -threshold, threshold)` regardless of what the smoothed gain computed, plus `np.nan_to_num` on the input — so bounded, finite output is guaranteed structurally, not just typically.
+
+**Why:** The unconditional final clip/`nan_to_num` step is the key safety property required by Stage 4 ("no NaN/Inf, output within configured bounds... even with deliberately over-range input") — it holds regardless of gain-smoothing lag or adversarial input, rather than relying on the smoothed-gain math alone to never overshoot.
+
+**Measured behavior (2026-08-23)**, threshold=0.98, sr=48000: a 5x-over-range 440Hz sine with injected `inf`/`-inf`/`nan`/`1e6`/`1e9`/`-1e9` samples produced output with `max(|y|) == 0.98` exactly, all finite, no NaN/Inf. A signal comfortably under threshold (0.3x) passed with negligible change (max deviation < 0.01). Noise gate at -40dB threshold: a well-below-threshold input (RMS 7.07e-4) settled to 0.0 steady-state RMS; a well-above-threshold input (RMS 0.3536) passed with steady-state RMS 0.3524 (~99.7% preserved). Full integrated `SignalChain` (HPF -> gate -> limiter) run block-wise (256-sample chunks) on an 8x-over-range signal with injected inf/nan/huge values stayed fully finite and bounded to 0.98.
+
+**Alternatives considered:** Lookahead limiting — rejected as out of scope/unnecessary added latency for this project; the smoothed-gain-plus-hard-clip approach meets the stated bounded/finite requirement without a lookahead buffer.
+
+**Stage:** Stage 4.
+
+---
+
 ### 2026-08-23 — Pitch shift algorithm
 
 **Decision:** Implement pitch shifting as phase-vocoder time-stretch (with true instantaneous-frequency phase reconstruction: measured phase deviation from each bin's expected phase advance, unwrapped, used to compute the bin's true instantaneous frequency, which drives the synthesis phase accumulation) followed by linear-interpolation resampling to restore original duration.
