@@ -222,7 +222,25 @@ Test suite (`tests/test_formant.py`) uses 2.0Hz F0 tolerance and 60Hz peak-locat
 
 **Confirmed on real hardware after the revert (2026-08-23, project owner, live run, `pitch_up_third` preset, 30s):** `callback_count=5644`, `underrun_count=19`, `underrun_samples=4864` (101.3ms total) -- closely matching the isolated synthetic prediction above (mostly the one-time startup delay plus a few isolated jitter events), and an ~18x reduction from the crossfade version's 368 underruns / 1846ms on the same hardware/preset. `bypass_count` and both queue-dropped counts remained 0.
 
-**A correct fix for the original (smaller) phase-discontinuity click, if pursued later**, would need to process genuinely *overlapping* windows of input (each worker iteration reprocessing some of the previous chunk's trailing input samples, the way traditional STFT overlap-add works) so there is real shared content to blend -- not just cross-fade the outputs of disjoint chunks. Not implemented; recorded under "Considered but out of scope" below.
+### 2026-08-23 — Overlap-window crossfade: a corrected, sample-conserving fix for the chunk-boundary click
+
+**Decision:** Replaced the reverted crossfade with one that gives each chunk `overlap_samples` (default 240, 5ms) of genuine input context reused from the tail of the *previous raw input chunk*, rather than blending two independently-sourced chunks. Because the overlap region in consecutive chunks' outputs now covers the same underlying input audio (processed twice, independently), blending it with a raised-cosine crossfade smooths a real discontinuity instead of discarding unique content. Steady-state emission is exactly `chunk_size` samples per worker iteration (verified by test and by direct sample-count comparison, both showing zero difference between total input consumed and total output emitted -- unlike the earlier version's ~240-samples-per-chunk deficit).
+
+**Why the previous attempt failed and this one doesn't:** the earlier crossfade held back the tail of chunk N and blended it into the *start* of chunk N+1's own output -- but chunk N and N+1 were built from disjoint, non-overlapping input, so their outputs at that point represent two *different* moments in the audio. Blending different content into fewer samples is lossy by construction. This version's overlap region is engineered to represent the *same* input samples in both chunks, so blending is legitimate smoothing (the standard technique used in real block-based audio processors), not lossy compression.
+
+**Measured (2026-08-23, synthetic, isolated from threading):** 3s of a 180Hz test tone through the pitch+formant pipeline: without any crossfade, 41 discontinuities (peak magnitude 0.51 on a 0.5-amplitude signal); with the overlap crossfade, 17 discontinuities (peak magnitude 0.17) -- a real reduction in both count and severity, not a complete elimination (the underlying independent-chunk phase-vocoder analysis still restarts each chunk; crossfading only smooths the amplitude transition, it cannot fully correct an underlying phase mismatch between two independently-vocoded chunks -- see the entry below for what a complete fix would require). Sample conservation verified exactly (0 sample difference between input consumed and output emitted, both via direct measurement and `tests/test_engine.py::test_emit_with_crossfade_conserves_all_samples`).
+
+**Live hardware status:** the project owner's most recent live confirmation ("pitch works well, clicks got worse") was of the *reverted* (no-crossfade) version, before this overlap-window crossfade existed -- not of this fix. This fix has not yet been tested live; the synthetic measurement above is real but is not a substitute for that. Update this entry once it has been.
+
+**Alternatives considered:** a fully continuous-phase streaming rewrite (no independent per-chunk analysis at all) would eliminate the discontinuity at its root rather than smoothing it, but is a substantially larger undertaking -- see below.
+
+**Stage:** Integration / live testing.
+
+---
+
+### 2026-08-23 — Remaining gap after the overlap-window crossfade
+
+**What's still not fixed:** the overlap-window crossfade above (implemented, verified via synthetic measurement to be sample-conserving and to meaningfully reduce discontinuity count/magnitude) is expected to reduce but not eliminate the chunk-boundary click -- live confirmation of this specific fix is still pending (see above). The remaining cause is structural: each chunk's phase-vocoder analysis still restarts independently (its own fresh synthesis-phase accumulator, its own fresh STFT frame 0), even though the *input* now genuinely overlaps between chunks. Two independent re-syntheses of the same input aren't guaranteed to agree in phase/timing, so blending them smooths the amplitude transition without necessarily correcting a phase mismatch underneath it. A complete fix requires a persistent per-bin synthesis-phase accumulator that never resets across the whole session -- i.e. the fully continuous-phase streaming rewrite described below -- rather than any further crossfade tuning on top of independently-processed chunks.
 
 **Stage:** Integration / live testing.
 
