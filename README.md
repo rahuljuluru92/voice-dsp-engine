@@ -27,12 +27,18 @@ gate / limiter chain on the output — all through a low-latency callback.
   drop-oldest queues so latency can't grow unbounded, and a bypass guard that
   outputs silence (never raw microphone audio) if processing fails, produces
   non-finite output, or misses its deadline.
-- **Live engine** (`src/voice_dsp/engine.py`): wires all of the above into a
+- **Continuous streaming processor** (`src/voice_dsp/streaming.py`): the
+  pitch/formant math restructured to run incrementally with a persistent
+  per-bin synthesis-phase accumulator that never resets, rather than
+  independently re-analyzing fixed-size chunks — verified to produce
+  identical output regardless of how the caller chunks its input (4096
+  samples at a time vs. 1 sample at a time), with no boundary artifacts.
+  See `DECISIONS.md` for why the earlier chunked approach (with or without
+  a crossfade) couldn't fully fix this.
+- **Live engine** (`src/voice_dsp/engine.py`): wires the above into a
   PortAudio duplex stream. The audio callback only moves data through
   bounded queues; the actual DSP runs on a background worker thread so the
-  real-time callback stays cheap. See `DECISIONS.md` for the architecture
-  and its known tradeoffs (chunk-boundary phase discontinuity, added
-  latency versus Stage 1's raw passthrough).
+  real-time callback stays cheap.
 
 This project does not include a GUI, file import/export, or network
 streaming — see `DECISIONS.md` for what was explicitly considered and kept
@@ -148,12 +154,18 @@ real hardware (MacBook Air built-in microphone/speakers): 5670 callbacks,
 output latency 31.854ms, mean callback compute time 2.5us, max 22.1us, 0
 underflows, 0 overflows.
 
+**Continuous streaming processor**: an earlier chunked architecture (with
+independent per-chunk phase-vocoder analysis, later with an overlap-window
+crossfade) produced an audible click at every chunk boundary. Replaced with
+`src/voice_dsp/streaming.py`, which never resets its internal phase state.
+Verified (`tests/test_streaming.py`) to produce identical output regardless
+of how the caller chunks input (4096 samples/call vs. 1 sample/call: max
+difference ~3e-12) and zero large discontinuities across tested pitch
+ratios. Live confirmation of this specific fix is still pending; see
+`DECISIONS.md` for status.
+
 ## Known limitations
 
-- The live engine processes audio in independent chunks (`chunk_size`,
-  default 4096 samples) through the worker thread; phase is not continuous
-  across chunk boundaries, which can produce an audible discontinuity at
-  each chunk edge (~every 85ms at defaults). See `DECISIONS.md`.
 - The cepstral formant-preserving pitch correction is not well-defined for
   signals lacking real harmonic content (e.g. a pure sine); this does not
   affect real voice input, which is always harmonically rich. See
