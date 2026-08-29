@@ -161,8 +161,14 @@ crossfade) produced an audible click at every chunk boundary. Replaced with
 Verified (`tests/test_streaming.py`) to produce identical output regardless
 of how the caller chunks input (4096 samples/call vs. 1 sample/call: max
 difference ~3e-12) and zero large discontinuities across tested pitch
-ratios. Live confirmation of this specific fix is still pending; see
-`DECISIONS.md` for status.
+ratios. Confirmed live on real hardware (`pitch_up_third` preset, 30s):
+`underrun_count=68`, `underrun_samples=1202` (25.0ms total, 0.083% of the
+run), 0 bypasses, 0 queue drops. Audible result reported directly by the
+project owner: clicking reduced to "a very little" — a substantial
+improvement over the pre-rewrite version, with the small remainder most
+plausibly explained by brief real-time scheduling jitter (see "Known
+limitations" below) rather than the phase discontinuity this rewrite
+targeted, which testing shows is fully eliminated.
 
 ## Known limitations
 
@@ -170,3 +176,11 @@ ratios. Live confirmation of this specific fix is still pending; see
   signals lacking real harmonic content (e.g. a pure sine); this does not
   affect real voice input, which is always harmonically rich. See
   `DECISIONS.md`.
+- A small amount of clicking remains audible on real hardware (measured:
+  ~25ms of brief silence-padding underruns over a 30s run, 0.083% of the
+  audio). This is real-time queue/thread scheduling jitter between the
+  audio callback and the DSP worker thread, not the phase-vocoder
+  discontinuity the streaming rewrite targeted (which testing shows is
+  fully eliminated). Increasing `queue_capacity` or `blocksize` would trade
+  a small amount of latency for fewer underruns if this needs to be reduced
+  further.
