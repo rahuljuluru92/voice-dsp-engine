@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .formant import cepstral_envelope, warp_envelope
+from .formant import cepstral_envelope, harmonicity_confidence, warp_envelope
 from .stft import periodic_hann
 
 TWO_PI = 2 * np.pi
@@ -126,7 +126,9 @@ class _StreamPhaseVocoder:
             envelope = cepstral_envelope(mag, self.cutoff_quefrency)
             excitation = mag / (envelope + EPS)
             new_envelope = warp_envelope(envelope, self.envelope_warp_ratio)
-            mag = excitation * new_envelope
+            confidence = harmonicity_confidence(mag)
+            effective_envelope = envelope + confidence * (new_envelope - envelope)
+            mag = excitation * effective_envelope
 
         out_spec = mag * np.exp(1j * self._synth_phase)
         frame_time = np.fft.irfft(out_spec, n=self.frame_size) * self.window

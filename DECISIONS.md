@@ -278,7 +278,7 @@ Test suite (`tests/test_formant.py`) uses 2.0Hz F0 tolerance and 60Hz peak-locat
 
 - ~~Fully continuous-phase streaming phase vocoder~~ — implemented; see the entry directly above.
 - **Overlapping-window chunk processing** to properly smooth the chunk-boundary phase discontinuity (see the crossfade-revert entry above for why a simple output-side crossfade doesn't work) -- would need real shared content between consecutive processing windows to blend correctly, not just independent chunks' outputs.
-- **Robust formant-envelope correction for non-harmonic (e.g. pure-tone) input** — the cepstral source-filter separation `pitch_shift_formant_preserving` relies on is not well-defined for signals without real harmonic structure (see the Stage 6 benchmark-debugging entry above). A more robust approach (e.g. detecting spectral sparsity/harmonicity and reducing or skipping the envelope correction accordingly) was not implemented, since real voice input is always harmonically rich and this only manifests on synthetic pure-tone test signals, not the engine's actual use case.
+- ~~Robust formant-envelope correction for non-harmonic (e.g. pure-tone) input~~ — implemented; see "Harmonicity-gated envelope correction" below.
 
 ---
 
@@ -299,4 +299,25 @@ Test suite (`tests/test_pitch.py`) uses a 1.0Hz absolute tolerance, ~30x margin 
 **Alternatives considered:** Naive resampling (changing playback rate directly) — rejected, changes duration and doesn't meet the phase-vocoder/instantaneous-frequency requirement. PSOLA — rejected as out of scope; phase vocoder is the specified technique and also generalizes better to the Stage 3 cepstral formant work sharing the same STFT machinery.
 
 **Stage:** Stage 2.
+
+---
+
+### 2026-08-23 — Harmonicity-gated envelope correction: fixing the pure-tone limitation
+
+**Decision:** Added `harmonicity_confidence(magnitude)` (`src/voice_dsp/formant.py`) and used it in both `shift_formants()` and the streaming processor's `_process_frame()` to blend between "no envelope correction" (confidence 0) and "full envelope correction" (confidence 1) per frame, rather than always applying the full correction. Confidence is based on counting distinct spectral peaks (`scipy.signal.find_peaks`, minimum height 10% of the frame's peak magnitude, minimum separation 5 FFT bins between counted peaks), ramping linearly from 0 at 1 peak to 1 at 3+ peaks.
+
+**Why now, and why not just leave it documented:** this had been recorded as an accepted, out-of-scope limitation ("real voice is always harmonically rich, so it doesn't matter") — true for the engine's actual use case, but the project owner asked for it fixed rather than left as a known gap, and a principled fix was available without touching the validated core algorithm.
+
+**Why a peak-count gate, and why the minimum-separation constraint specifically:** the cepstral envelope/excitation split assumes a harmonic excitation source (many partials); on a single dominant spectral component it just smooths that one peak into a hump and can misplace it when warped. A naive peak-count check (no separation constraint) was tried first and failed: a pure sine that had already gone through phase-vocoder stretch + resample showed 3 "peaks" from spectral leakage sidelobes only ~4 bins (~94Hz) apart from the true tone, clustered tightly around it -- `harmonicity_confidence` reported full confidence (1.0) and the correction still corrupted the frequency exactly as before. Requiring peaks to be at least 5 bins (~117Hz at the default frame_size=2048/sr=48000) apart rejects those leakage sidelobes (3 -> 1 peak) while real voice harmonics -- spaced by the fundamental period, at least ~80Hz for adult speech and typically far more -- remain unaffected (verified: 5 real peaks still counted on the standard two-formant test vowel). The linear confidence ramp (rather than a hard threshold) avoids a frame-to-frame on/off flicker that would itself be a new discontinuity, given how much of this session was spent eliminating exactly that class of artifact elsewhere.
+
+**Measured (2026-08-23):**
+- `harmonicity_confidence`: <0.1 on a windowed pure 220Hz tone frame, >0.9 on a windowed frame from the standard two-formant test vowel.
+- Pure-sine Stage 6-style benchmark (8 presets x 3 base frequencies = 24 cases, previously 19/24 passing with 5 failures at large pitch shifts): now 24/24 passing, all errors under 0.04Hz.
+- Direct isolation case that originally exposed this: `pitch.pitch_shift()` (no formant correction) on a 220Hz sine at +12 semitones measured 440.000Hz (unchanged reference); `formant.process()` (with correction) previously measured 252.5Hz, now measures 440.000Hz -- matching the reference exactly.
+- Streaming processor: the same +12 semitone pure-tone case, previously ~252.5Hz, now measures 439.996Hz.
+- No regression: full unit suite 43/43 passing (including the existing Stage 3/6 harmonic-signal formant-independence tests, unchanged), Stage 6 validation benchmark still 24/24 with an unchanged worst-case error (+0.3141Hz).
+
+**Alternatives considered:** A hard peak-count threshold (skip correction entirely below N peaks) — rejected in favor of the linear confidence ramp, to avoid introducing frame-to-frame flicker on borderline signals. Spectral flatness as the discriminator — rejected; a pure tone and a strongly-formant-shaped harmonic signal can have similar flatness, whereas peak count with a minimum-separation constraint directly targets the actual failure mode (one dominant component vs. genuinely multiple).
+
+**Stage:** Stage 3 / Stage 6 (fix applied retroactively to both).
 

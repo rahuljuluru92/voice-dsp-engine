@@ -18,11 +18,62 @@ controllable.
 from __future__ import annotations
 
 import numpy as np
+from scipy.signal import find_peaks
 
 from .pitch import phase_vocoder_stretch, semitones_to_ratio
 from .stft import istft, periodic_hann, stft
 
 EPS = 1e-10
+
+
+def harmonicity_confidence(
+    magnitude: np.ndarray,
+    min_peaks: int = 3,
+    height_frac: float = 0.1,
+    min_separation_bins: int = 5,
+) -> float:
+    """Confidence (0..1) that `magnitude` has enough distinct spectral
+    peaks for cepstral envelope/excitation separation to be meaningful.
+
+    The technique assumes a harmonic excitation source (many partials);
+    on a signal with only one dominant spectral component (e.g. a pure
+    sine), the "envelope" it extracts is really just a smoothed version
+    of that single peak, and warping+reapplying it can misplace the
+    peak entirely rather than correctly relocating a real envelope over
+    real harmonic content (see DECISIONS.md, "Stage 6 benchmark
+    debugging" and "Considered but out of scope" entries -- this
+    resolves that limitation rather than just documenting it).
+
+    `min_separation_bins` requires counted peaks to be at least that
+    many FFT bins apart (default 5 bins, ~117Hz at the project's
+    default frame_size=2048/sr=48000). This matters: a single tone that
+    has gone through phase-vocoder stretch + resample can pick up
+    spectral leakage sidelobes that `find_peaks` would otherwise count
+    as extra "harmonics" a few bins from the true peak -- confirmed
+    directly (a resampled 220Hz->+12st pure tone showed 3 "peaks" only
+    ~4 bins apart before this constraint, 1 after). Real voice harmonics
+    are spaced by the fundamental period (at least ~80Hz for adult
+    speech, typically much more), well beyond this distance, so the
+    constraint doesn't affect real multi-partial content.
+
+    Returns 0.0 for a single dominant peak, ramping linearly up to 1.0
+    once there are at least `min_peaks` significant, separated peaks
+    (typical of real voice). The linear ramp (rather than a hard on/off
+    threshold) matters for real audio: an abrupt full-strength/no
+    -strength switch between frames would itself be a new discontinuity
+    of exactly the kind this whole project has spent so much effort
+    eliminating elsewhere.
+    """
+    if min_peaks <= 1:
+        return 1.0
+    peak_max = magnitude.max()
+    if peak_max <= 0:
+        return 1.0
+    peaks, _ = find_peaks(
+        magnitude, height=peak_max * height_frac, distance=max(1, min_separation_bins)
+    )
+    n_peaks = len(peaks)
+    return float(np.clip((n_peaks - 1) / (min_peaks - 1), 0.0, 1.0))
 
 
 def cepstral_envelope(magnitude: np.ndarray, cutoff_quefrency: int) -> np.ndarray:
@@ -85,7 +136,9 @@ def shift_formants(
         envelope = cepstral_envelope(mag, cutoff_quefrency)
         excitation = mag / (envelope + EPS)
         new_envelope = warp_envelope(envelope, warp_ratio)
-        new_mag = excitation * new_envelope
+        confidence = harmonicity_confidence(mag)
+        effective_envelope = envelope + confidence * (new_envelope - envelope)
+        new_mag = excitation * effective_envelope
         out_spec[i] = new_mag * np.exp(1j * phase)
 
     y = istft(out_spec, hop_size, window, length=len(xp))

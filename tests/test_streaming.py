@@ -178,3 +178,21 @@ def test_pitch_only_shift_preserves_formant_peaks_streaming():
 
     for before, after in zip(peaks_before, peaks_after):
         assert abs(after - before) < 60.0
+
+
+def test_pure_tone_pitch_shift_not_corrupted_streaming():
+    # Regression test matching tests/test_formant.py's equivalent: the
+    # streaming processor's unified pitch+formant envelope warp used to
+    # have the same pure-tone corruption as the offline algorithm
+    # (confirmed: a 220Hz sine at +12 semitones measured ~252.5Hz before
+    # the harmonicity_confidence fix). Verify it now matches the
+    # expected shifted frequency.
+    sp = StreamingVoiceProcessor(sr=SR, pitch_semitones=12.0, formant_semitones=0.0)
+    t = np.arange(int(SR * 2)) / SR
+    x = 0.8 * np.sin(2 * np.pi * 220.0 * t)
+
+    y = _feed_in_chunks(sp, x, chunk_size=256)
+
+    edge = int(SR * 0.1)
+    measured = _measure_freq(y[edge:-1000], SR)
+    assert abs(measured - 440.0) < FREQ_TOLERANCE_HZ
