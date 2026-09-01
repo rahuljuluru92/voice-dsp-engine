@@ -172,10 +172,6 @@ targeted, which testing shows is fully eliminated.
 
 ## Known limitations
 
-- The cepstral formant-preserving pitch correction is not well-defined for
-  signals lacking real harmonic content (e.g. a pure sine); this does not
-  affect real voice input, which is always harmonically rich. See
-  `DECISIONS.md`.
 - A small amount of clicking remains audible on real hardware (measured:
   ~25ms of brief silence-padding underruns over a 30s run, 0.083% of the
   audio). This is real-time queue/thread scheduling jitter between the
