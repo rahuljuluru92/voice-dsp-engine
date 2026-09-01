@@ -13,11 +13,17 @@ fed by that output queue, and outputs silence if not enough processed
 audio is ready yet (never raw passthrough).
 
 This keeps the real-time thread safe by construction, at the cost of
-one chunk's worth of latency before processing can begin, and (since
-each chunk is processed independently) a phase-vocoder analysis
-discontinuity at each chunk boundary — see DECISIONS.md /
-ASSUMPTIONS.md for the measured latency and the boundary-artifact
-tradeoff.
+one chunk's worth of latency before processing can begin. Each chunk
+is still DSP-processed independently (no continuous phase-vocoder
+state across the whole session), which causes a phase-vocoder analysis
+discontinuity at each chunk boundary; consecutive chunks are given a
+small amount of genuinely overlapping input context and their outputs
+crossfaded in that overlap region (see `_emit_with_crossfade`) to
+reduce (not eliminate) the audible effect of that discontinuity,
+without discarding audio the way a naive crossfade of non-overlapping
+chunks would (see DECISIONS.md for the earlier, reverted attempt that
+did exactly that). See DECISIONS.md / ASSUMPTIONS.md for measured
+latency and boundary-artifact numbers.
 """
 
 from __future__ import annotations
@@ -48,6 +54,7 @@ class VoiceEngine:
         limiter_threshold: float = 0.98,
         queue_capacity: int = 4,
         max_process_seconds: float | None = 1.0,
+        overlap_samples: int = 240,
     ):
         self.sr = sr
         self.chunk_size = chunk_size
@@ -55,6 +62,7 @@ class VoiceEngine:
         self.analysis_hop = analysis_hop
         self.pitch_semitones = pitch_semitones
         self.formant_semitones = formant_semitones
+        self.overlap_samples = overlap_samples
 
         self.chain = SignalChain(
             sr=sr,
@@ -68,6 +76,12 @@ class VoiceEngine:
 
         self._input_accum = np.zeros(0, dtype=np.float64)
         self._output_leftover = np.zeros(0, dtype=np.float64)
+        self._prev_raw_tail = np.zeros(0, dtype=np.float64)
+        self._held_tail: np.ndarray | None = None
+        self._fade_in = (
+            0.5 - 0.5 * np.cos(np.linspace(0, np.pi, overlap_samples))
+            if overlap_samples > 0 else np.zeros(0)
+        )
         self.underrun_count = 0
         self.underrun_samples = 0
         self.callback_count = 0
@@ -84,26 +98,64 @@ class VoiceEngine:
         )
         return self.chain.process(y)
 
+    def _emit_with_crossfade(self, processed: np.ndarray) -> np.ndarray:
+        """Turn one processed (possibly overlap-extended) chunk into the
+        `chunk_size` samples of output to actually emit this iteration.
+
+        Each chunk fed to `_dsp_pipeline` includes `overlap_samples` of
+        genuine input context reused from the tail of the previous raw
+        input chunk (see `audio_callback`), so -- unlike the earlier,
+        reverted crossfade attempt -- the overlapping region here really
+        does represent the same underlying audio processed twice, not
+        two different moments. Blending it is therefore smoothing, not
+        discarding: the last `overlap_samples` of this chunk's output
+        are held back and blended into the *start* of the next chunk's
+        own overlap region next iteration, and steady-state emission is
+        exactly `chunk_size` samples per call (verified in
+        tests/test_engine.py), unlike the earlier version which lost
+        `overlap_samples` of real audio every cycle.
+        """
+        n = self.overlap_samples
+        if n <= 0:
+            return processed
+
+        if self._held_tail is None:
+            # First chunk: no held-back tail to blend with yet, and (per
+            # audio_callback) this chunk has no prefix context either
+            # (length == chunk_size, not chunk_size + n).
+            emit = processed[: self.chunk_size - n]
+        else:
+            # Non-first chunk: length == chunk_size + n. Layout:
+            #   [0:n]              overlap region, shared with the
+            #                      previous chunk's held-back tail
+            #   [n:chunk_size]     unambiguous new content (length
+            #                      chunk_size - n), emitted as-is
+            #   [chunk_size:+n]    new overlap region, held back for
+            #                      next iteration's blend
+            fade_in = self._fade_in
+            fade_out = 1.0 - fade_in
+            blended = self._held_tail * fade_out + processed[:n] * fade_in
+            emit = np.concatenate([blended, processed[n:self.chunk_size]])
+
+        tail_start = len(processed) - n
+        self._held_tail = processed[tail_start:].copy()
+        return emit
+
     def _worker_loop(self) -> None:
-        # NOTE: an earlier version of this method held back and
-        # cross-faded the tail of each processed chunk into the next
-        # one, aiming to smooth the chunk-boundary discontinuity
-        # documented below. That was reverted (2026-08-23): chunk N and
-        # chunk N+1 do not share any overlapping input time, so blending
-        # them into one shorter segment silently discarded real audio
-        # every cycle rather than smoothing anything -- confirmed live
-        # (an accumulating output deficit matching the crossfade width
-        # times the number of chunks processed). See DECISIONS.md.
         while not self._stop_event.is_set():
             chunk = self.input_queue.get()
             if chunk is None:
                 time.sleep(0.001)
                 continue
             processed = self.guard.safe_process(chunk)
-            self.output_queue.put(processed)
+            emit = self._emit_with_crossfade(processed)
+            if len(emit):
+                self.output_queue.put(emit)
 
     def start(self) -> None:
         self._stop_event.clear()
+        self._prev_raw_tail = np.zeros(0, dtype=np.float64)
+        self._held_tail = None
         self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker_thread.start()
 
@@ -112,6 +164,11 @@ class VoiceEngine:
         if self._worker_thread is not None:
             self._worker_thread.join(timeout=2.0)
             self._worker_thread = None
+        # Safe to touch _held_tail now that the worker thread (the only
+        # other writer) has fully exited.
+        if self._held_tail is not None and len(self._held_tail):
+            self.output_queue.put(self._held_tail)
+            self._held_tail = None
 
     def _pull_output(self, n_needed: int) -> np.ndarray:
         while len(self._output_leftover) < n_needed:
@@ -138,10 +195,22 @@ class VoiceEngine:
     def audio_callback(self, indata, outdata, frames, time_info, status) -> None:
         self.callback_count += 1
         self._input_accum = np.concatenate([self._input_accum, indata[:, 0].astype(np.float64)])
+        n = self.overlap_samples
         while len(self._input_accum) >= self.chunk_size:
-            chunk = self._input_accum[: self.chunk_size]
+            new_part = self._input_accum[: self.chunk_size]
             self._input_accum = self._input_accum[self.chunk_size:]
-            self.input_queue.put(chunk)
+            if n > 0 and len(self._prev_raw_tail) == n:
+                # Prepend genuine overlap context (the same raw input
+                # samples the previous chunk ended with), so the two
+                # chunks' outputs share real underlying audio in their
+                # overlap region instead of being unrelated. See
+                # _emit_with_crossfade.
+                windowed = np.concatenate([self._prev_raw_tail, new_part])
+            else:
+                windowed = new_part
+            if n > 0:
+                self._prev_raw_tail = new_part[-n:].copy()
+            self.input_queue.put(windowed)
 
         outdata[:, 0] = self._pull_output(frames)
 
