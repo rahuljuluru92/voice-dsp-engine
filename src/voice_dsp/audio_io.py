@@ -93,7 +93,15 @@ def run_passthrough(
             while True:
                 time.sleep(0.1)
         else:
-            time.sleep(duration)
+            # Tick visibly once a second rather than sleeping silently
+            # for the whole duration, so a running (vs. hung) process
+            # is obvious from the terminal.
+            elapsed = 0.0
+            while elapsed < duration:
+                step = min(1.0, duration - elapsed)
+                time.sleep(step)
+                elapsed += step
+                print(f"  ...{elapsed:.0f}s / {duration:.0f}s", flush=True)
 
     return stats
 

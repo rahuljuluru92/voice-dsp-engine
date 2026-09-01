@@ -186,6 +186,30 @@ Test suite (`tests/test_formant.py`) uses 2.0Hz F0 tolerance and 60Hz peak-locat
 
 ---
 
+### 2026-08-23 — Stage 1 live passthrough: real measured hardware numbers
+
+**Decision/record:** Ran `python3 src/voice_dsp/audio_io.py 30` live against real hardware (MacBook Air built-in microphone/speakers, default PortAudio devices) for the full 30 seconds. Result: 5670 callbacks, 1,451,520 frames processed, reported input latency 227.021ms, reported output latency 31.854ms, mean callback compute time 2.5us, max callback compute time 22.1us, 0 underflows, 0 overflows. This replaces the earlier "pending" status in ASSUMPTIONS.md — Stage 1's live-hardware success criterion (30s run, no crash, latency recorded) is now genuinely satisfied.
+
+**Note on input latency:** the reported ~227ms input latency is notably higher than the ~32ms output latency; this is PortAudio/Core Audio reporting its own device buffering, not something this project's code controls, and is consistent with typical built-in-mic latency behavior on macOS at `latency="low"` request (the OS does not always honor the low-latency request equally for input vs. output). Not investigated further as it is outside the scope of what the passthrough callback itself can affect.
+
+**Stage:** Stage 1.
+
+---
+
+### 2026-08-23 — Progress printing during live audio: safe for Stage 1, not for the live engine
+
+**What happened:** After the project owner reported `python3 src/voice_dsp/audio_io.py 30` appearing to hang with no visible progress, a once-per-second `print(..., flush=True)` tick was added to both `audio_io.run_passthrough()` and `VoiceEngine.run()`. Live testing (by the project owner, with headphones) of the passthrough script showed no audible issue (0 underflows/overflows). Live testing of `VoiceEngine.run()` with the `pitch_up_third` preset produced audible small "beep"/click artifacts once per second, matching the tick's cadence exactly.
+
+**Root cause:** Python's GIL means only one thread executes Python bytecode at a time. `print(..., flush=True)` forces an immediate write syscall on the main thread; if that happens at the wrong moment it can briefly delay the audio callback thread, which only has ~5.3ms of slack per block at blocksize=256/sr=48000. `VoiceEngine`'s callback and its worker thread (real STFT-based pitch/formant/chain processing) have far less margin than Stage 1's trivial copy-through callback, which is the most likely reason the same change was audible on one and not the other.
+
+**Decision:** Reverted the periodic print for `VoiceEngine.run()` back to a silent `time.sleep(duration)` — audio quality takes priority over a printed progress readout for the live engine specifically. Kept the once-per-second tick for `audio_io.run_passthrough()`, since it was verified not to cause audible artifacts there and does address the original "looks hung" confusion for that zero-DSP script.
+
+**Why this matters generally:** any non-essential I/O on the main thread of a process that's also running a real-time Python audio callback is a latency risk, not just a curiosity — this was found through actual live listening, not simulated in a test.
+
+**Stage:** Integration / live testing.
+
+---
+
 ### 2026-08-23 — Considered but out of scope
 
 - **Fully continuous-phase streaming phase vocoder** (incremental STFT with a persistent per-bin synthesis-phase accumulator across the whole session, rather than independent per-chunk processing) — would remove the chunk-boundary discontinuity described above and reduce latency. Left as a documented future improvement rather than implemented now, per the chunked-worker-thread tradeoff above.
