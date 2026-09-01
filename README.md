@@ -1,15 +1,15 @@
 # Voice DSP Engine
 
 A real-time pitch- and formant-shifting voice engine, built entirely from
-scratch in Python — no third-party voice-changer library, no black-box DSP.
-It listens to your microphone and reshapes your voice live: higher, lower,
-bigger, smaller, or any combination, while staying clean, low-latency, and
-safe against crashes and glitches.
+scratch in Python, with no third-party voice-changer library and no
+black-box DSP. It listens to your microphone and reshapes your voice live:
+higher, lower, bigger, smaller, or any combination, while staying clean,
+low-latency, and safe against crashes and glitches.
 
-Every stage of the signal path — the FFT framing, the phase vocoder, the
-cepstral formant math, the biquad filter, the noise gate, the limiter, the
-runtime scheduling — is implemented directly on top of `numpy`/`scipy`, not
-delegated to an existing pitch-shifting library.
+Every stage of the signal path, from FFT framing through the phase vocoder,
+the cepstral formant math, the biquad filter, the noise gate, the limiter,
+and the runtime scheduling, is implemented directly on top of
+`numpy`/`scipy`, not delegated to an existing pitch-shifting library.
 
 ## What it actually does
 
@@ -19,16 +19,16 @@ preset you choose:
 
 | Preset                  | Pitch     | Formant   | Effect                                   |
 |--------------------------|-----------|-----------|-------------------------------------------|
-| `identity`               | —         | —         | Passthrough, no change (sanity check)     |
-| `pitch_up_third`         | +4 st     | —         | Higher voice, same "size"                 |
-| `pitch_down_third`       | -4 st     | —         | Lower voice, same "size"                  |
-| `pitch_up_octave`        | +12 st    | —         | An octave up                              |
-| `formant_up`             | —         | +4 st     | Smaller-sounding voice, same pitch        |
-| `formant_down`           | —         | -4 st     | Bigger-sounding voice, same pitch         |
+| `identity`               | 0 st      | 0 st      | Passthrough, no change (sanity check)     |
+| `pitch_up_third`         | +4 st     | 0 st      | Higher voice, same "size"                 |
+| `pitch_down_third`       | -4 st     | 0 st      | Lower voice, same "size"                  |
+| `pitch_up_octave`        | +12 st    | 0 st      | An octave up                              |
+| `formant_up`             | 0 st      | +4 st     | Smaller-sounding voice, same pitch        |
+| `formant_down`           | 0 st      | -4 st     | Bigger-sounding voice, same pitch         |
 | `pitch_and_formant_up`   | +5 st     | +3 st     | Higher and smaller-sounding together      |
 | `pitch_up_formant_down`  | +7 st     | -3 st     | Higher pitch, bigger-sounding voice       |
 
-**Pitch** and **formant** are controlled independently — that's the core
+**Pitch** and **formant** are controlled independently. That's the core
 technical claim of the project, and it's what separates this from a cheap
 "speed up the tape" voice changer. Pitch is how high or low a note sounds;
 formants are what make a voice sound like it's coming from a big or small
@@ -40,19 +40,19 @@ change the apparent size of the speaker *without* changing the note.
 ## Core features
 
 - **Real-time phase-vocoder pitch shifting** with true instantaneous-frequency
-  phase reconstruction — not naive resampling, which would change duration
-  and destroy phase coherence between harmonics.
-- **Independent formant control** via cepstral-envelope warping — moves the
+  phase reconstruction, not naive resampling (naive resampling would change
+  duration and destroy phase coherence between harmonics).
+- **Independent formant control** via cepstral-envelope warping: moves the
   spectral envelope (formants) without touching the fundamental frequency,
   and vice versa.
-- **Continuous streaming DSP** — a persistent per-bin phase accumulator that
+- **Continuous streaming DSP**: a persistent per-bin phase accumulator that
   never resets, so there are no chunk-boundary artifacts regardless of how
   audio happens to arrive from the OS.
-- **A real signal chain**: high-pass filter → noise gate → limiter, all
-  running on every block, with the limiter structurally guaranteeing finite,
-  bounded output no matter what comes in.
+- **A real signal chain**: high-pass filter, then noise gate, then limiter,
+  all running on every block, with the limiter structurally guaranteeing
+  finite, bounded output no matter what comes in.
 - **Fails safe, not loud**: bounded queues prevent runaway latency, and a
-  bypass guard emits silence — never raw, unprocessed microphone audio — if
+  bypass guard emits silence (never raw, unprocessed microphone audio) if
   anything in the pipeline breaks or falls behind.
 - **Backed by real measurements, not vibes**: every tolerance in the test
   suite and every claim in this README traces back to an actual number,
@@ -85,24 +85,24 @@ mic → [audio callback: cheap, real-time-safe]
 ```
 
 The real-time audio callback (the piece PortAudio calls on a tight, strict
-schedule) does almost nothing — it just moves raw audio into a queue and
-pulls processed audio out of another one. All the actual math — FFTs, phase
-tracking, filtering — happens on a separate worker thread, so a slow DSP
-step can never stall the audio hardware. If the worker ever falls behind,
-you get silence, never a glitch or the raw unprocessed input.
+schedule) does almost nothing: it just moves raw audio into a queue and
+pulls processed audio out of another one. All the actual math (FFTs, phase
+tracking, filtering) happens on a separate worker thread, so a slow DSP step
+can never stall the audio hardware. If the worker ever falls behind, you get
+silence, never a glitch or the raw unprocessed input.
 
 ### The DSP pipeline, module by module
 
 | Module | Responsibility |
 |---|---|
-| `stft.py` | Framing, windowing (periodic Hann), and weighted-overlap-add reconstruction. The foundation everything else is built on — validated to reconstruct a signal to within machine precision. |
+| `stft.py` | Framing, windowing (periodic Hann), and weighted-overlap-add reconstruction. The foundation everything else is built on, validated to reconstruct a signal to within machine precision. |
 | `pitch.py` | Phase-vocoder time-stretch with true instantaneous-frequency tracking, followed by resampling to restore duration and shift pitch. |
 | `formant.py` | Cepstral-envelope extraction and frequency-axis warping, used to move formants independently of pitch and to cancel the formant-shifting side effect that resampling would otherwise introduce. |
-| `streaming.py` | The pitch + formant math re-derived to run incrementally, forever, with no restart points — this is what makes the live engine click-free. |
+| `streaming.py` | The pitch and formant math re-derived to run incrementally, forever, with no restart points. This is what makes the live engine click-free. |
 | `filters.py` | An RBJ-cookbook biquad high-pass filter, derived from closed-form coefficients, not a library black box. |
 | `dynamics.py` | A noise gate (mutes silence/background hiss) and a limiter (structurally guarantees bounded output). |
 | `chain.py` | Wires the filter, gate, and limiter into one processing chain. |
-| `queues.py` | A thread-safe, capacity-bounded, drop-oldest queue — latency can never grow without bound. |
+| `queues.py` | A thread-safe, capacity-bounded, drop-oldest queue: latency can never grow without bound. |
 | `bypass.py` | Wraps the DSP pipeline; on any failure, non-finite output, or missed deadline, emits silence instead. |
 | `engine.py` | The live engine: wires everything above into an actual PortAudio duplex stream. |
 | `presets.py` | The named pitch/formant combinations listed in the table above. |
@@ -121,7 +121,7 @@ voice-dsp-engine/
 ```
 
 `DECISIONS.md` and `ASSUMPTIONS.md` are worth reading if you want the full
-story — they document the actual engineering process, including two dead
+story: they document the actual engineering process, including two dead
 ends (a chunking approach that clicked at every boundary, and a crossfade
 fix that turned out to silently discard audio) before arriving at the
 current architecture, all with real measured numbers rather than
@@ -174,7 +174,7 @@ python3 -m pytest
 
 43 tests covering every module, from bit-exact STFT reconstruction to full
 threaded engine integration. Every tolerance in the suite is backed by a
-real measurement recorded in `DECISIONS.md` — not picked arbitrarily.
+real measurement recorded in `DECISIONS.md`, not picked arbitrarily.
 
 ### Run the validation benchmark
 
@@ -189,7 +189,7 @@ frequency against what was expected.
 
 ## Measured results
 
-Everything below is a real number, produced by actually running the code —
+Everything below is a real number, produced by actually running the code,
 never a placeholder.
 
 - **STFT round-trip**: 3.33e-16 max absolute error (essentially the limit of
@@ -213,18 +213,18 @@ never a placeholder.
   correct, and the chunk-boundary clicking that an earlier architecture had
   is reduced to nearly nothing.
 
-The full, unabridged version of every measurement above — including the
-things that didn't work on the first try — is in `DECISIONS.md`.
+The full, unabridged version of every measurement above, including the
+things that didn't work on the first try, is in `DECISIONS.md`.
 
 ## Known limitations
 
 - A very small amount of audio-scheduling jitter (~0.08% of runtime,
   measured) is still audible on real hardware as an occasional faint click.
-  This is real-time thread scheduling noise, not a DSP correctness issue —
+  This is real-time thread scheduling noise, not a DSP correctness issue:
   the phase-vocoder discontinuity that used to cause audible clicking has
   been fully eliminated and verified with deterministic, chunk-size-invariant
   tests. Increasing `queue_capacity` or `blocksize` would trade a little
   more latency for less of this jitter, if needed.
 - This project intentionally does not include a GUI, file import/export, or
-  network streaming — see `DECISIONS.md` for what was considered and kept
+  network streaming. See `DECISIONS.md` for what was considered and kept
   out of scope.
