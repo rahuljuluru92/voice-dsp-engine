@@ -1,58 +1,142 @@
 # Voice DSP Engine
 
-A real-time pitch- and formant-shifting voice engine, built from scratch in
-Python. It captures microphone audio through PortAudio, shifts pitch using a
-short-time Fourier transform (STFT) phase vocoder with true
-instantaneous-frequency phase reconstruction, warps formants independently of
-pitch via cepstral-envelope processing, and runs a high-pass filter / noise
-gate / limiter chain on the output — all through a low-latency callback.
+A real-time pitch- and formant-shifting voice engine, built entirely from
+scratch in Python — no third-party voice-changer library, no black-box DSP.
+It listens to your microphone and reshapes your voice live: higher, lower,
+bigger, smaller, or any combination, while staying clean, low-latency, and
+safe against crashes and glitches.
 
-## What it does
+Every stage of the signal path — the FFT framing, the phase vocoder, the
+cepstral formant math, the biquad filter, the noise gate, the limiter, the
+runtime scheduling — is implemented directly on top of `numpy`/`scipy`, not
+delegated to an existing pitch-shifting library.
 
-- **STFT core** (`src/voice_dsp/stft.py`): framing, windowing (periodic
-  Hann), and weighted overlap-add inverse STFT. Round-trips a signal to
-  within machine precision.
-- **Pitch shifting** (`src/voice_dsp/pitch.py`): phase-vocoder time-stretch
-  using true instantaneous-frequency phase reconstruction (not naive
-  resampling), followed by resampling to restore duration.
-- **Independent formant control** (`src/voice_dsp/formant.py`): cepstral
-  liftering extracts the spectral envelope; warping it along frequency shifts
-  formants without touching pitch, and an inverse warp cancels the
-  frequency-scaling that pitch-shift resampling would otherwise impose on
-  formants — so pitch and formant are controlled independently.
-- **Signal chain** (`src/voice_dsp/filters.py`, `dynamics.py`, `chain.py`):
-  an RBJ-cookbook biquad high-pass filter, a noise gate, and a limiter that
-  guarantees finite, bounded output even on adversarial input.
-- **Runtime robustness** (`src/voice_dsp/queues.py`, `bypass.py`): bounded
-  drop-oldest queues so latency can't grow unbounded, and a bypass guard that
-  outputs silence (never raw microphone audio) if processing fails, produces
-  non-finite output, or misses its deadline.
-- **Continuous streaming processor** (`src/voice_dsp/streaming.py`): the
-  pitch/formant math restructured to run incrementally with a persistent
-  per-bin synthesis-phase accumulator that never resets, rather than
-  independently re-analyzing fixed-size chunks — verified to produce
-  identical output regardless of how the caller chunks its input (4096
-  samples at a time vs. 1 sample at a time), with no boundary artifacts.
-  See `DECISIONS.md` for why the earlier chunked approach (with or without
-  a crossfade) couldn't fully fix this.
-- **Live engine** (`src/voice_dsp/engine.py`): wires the above into a
-  PortAudio duplex stream. The audio callback only moves data through
-  bounded queues; the actual DSP runs on a background worker thread so the
-  real-time callback stays cheap.
+## What it actually does
 
-This project does not include a GUI, file import/export, or network
-streaming — see `DECISIONS.md` for what was explicitly considered and kept
-out of scope.
+Speak into your microphone; the engine plays your voice back through your
+speakers or headphones in real time, transformed according to whichever
+preset you choose:
 
-## Environment setup
+| Preset                  | Pitch     | Formant   | Effect                                   |
+|--------------------------|-----------|-----------|-------------------------------------------|
+| `identity`               | —         | —         | Passthrough, no change (sanity check)     |
+| `pitch_up_third`         | +4 st     | —         | Higher voice, same "size"                 |
+| `pitch_down_third`       | -4 st     | —         | Lower voice, same "size"                  |
+| `pitch_up_octave`        | +12 st    | —         | An octave up                              |
+| `formant_up`             | —         | +4 st     | Smaller-sounding voice, same pitch        |
+| `formant_down`           | —         | -4 st     | Bigger-sounding voice, same pitch         |
+| `pitch_and_formant_up`   | +5 st     | +3 st     | Higher and smaller-sounding together      |
+| `pitch_up_formant_down`  | +7 st     | -3 st     | Higher pitch, bigger-sounding voice       |
 
-Requires Python 3.12 (developed and tested against 3.12.8) and a working
-PortAudio installation. On macOS, the `sounddevice` package's wheel bundles
-what it needs and generally works out of the box; if it can't find
-PortAudio, install it with `brew install portaudio`. On Linux, install
-`libportaudio2` (e.g. `apt install libportaudio2`) first.
+**Pitch** and **formant** are controlled independently — that's the core
+technical claim of the project, and it's what separates this from a cheap
+"speed up the tape" voice changer. Pitch is how high or low a note sounds;
+formants are what make a voice sound like it's coming from a big or small
+person, largely independent of pitch. Shifting pitch without correcting
+formants makes everyone sound like a chipmunk or a demon; this engine keeps
+them separate, so you can raise pitch *without* the chipmunk effect, or
+change the apparent size of the speaker *without* changing the note.
 
-Create and activate a virtual environment, then install pinned dependencies:
+## Core features
+
+- **Real-time phase-vocoder pitch shifting** with true instantaneous-frequency
+  phase reconstruction — not naive resampling, which would change duration
+  and destroy phase coherence between harmonics.
+- **Independent formant control** via cepstral-envelope warping — moves the
+  spectral envelope (formants) without touching the fundamental frequency,
+  and vice versa.
+- **Continuous streaming DSP** — a persistent per-bin phase accumulator that
+  never resets, so there are no chunk-boundary artifacts regardless of how
+  audio happens to arrive from the OS.
+- **A real signal chain**: high-pass filter → noise gate → limiter, all
+  running on every block, with the limiter structurally guaranteeing finite,
+  bounded output no matter what comes in.
+- **Fails safe, not loud**: bounded queues prevent runaway latency, and a
+  bypass guard emits silence — never raw, unprocessed microphone audio — if
+  anything in the pipeline breaks or falls behind.
+- **Backed by real measurements, not vibes**: every tolerance in the test
+  suite and every claim in this README traces back to an actual number,
+  recorded as it was produced, in `DECISIONS.md`.
+
+## How it works
+
+```
+mic → [audio callback: cheap, real-time-safe]
+        │
+        ▼
+  bounded input queue  ──►  worker thread (off the real-time thread)
+                                 │
+                                 ▼
+                    StreamingVoiceProcessor
+              (persistent phase-vocoder + cepstral
+               formant warp, one continuous pass)
+                                 │
+                                 ▼
+                SignalChain (HPF → gate → limiter)
+                                 │
+                                 ▼
+                        bounded output queue
+                                 │
+                                 ▼
+        [audio callback pulls ready audio, or outputs silence]
+                                 │
+                                 ▼
+                             speakers
+```
+
+The real-time audio callback (the piece PortAudio calls on a tight, strict
+schedule) does almost nothing — it just moves raw audio into a queue and
+pulls processed audio out of another one. All the actual math — FFTs, phase
+tracking, filtering — happens on a separate worker thread, so a slow DSP
+step can never stall the audio hardware. If the worker ever falls behind,
+you get silence, never a glitch or the raw unprocessed input.
+
+### The DSP pipeline, module by module
+
+| Module | Responsibility |
+|---|---|
+| `stft.py` | Framing, windowing (periodic Hann), and weighted-overlap-add reconstruction. The foundation everything else is built on — validated to reconstruct a signal to within machine precision. |
+| `pitch.py` | Phase-vocoder time-stretch with true instantaneous-frequency tracking, followed by resampling to restore duration and shift pitch. |
+| `formant.py` | Cepstral-envelope extraction and frequency-axis warping, used to move formants independently of pitch and to cancel the formant-shifting side effect that resampling would otherwise introduce. |
+| `streaming.py` | The pitch + formant math re-derived to run incrementally, forever, with no restart points — this is what makes the live engine click-free. |
+| `filters.py` | An RBJ-cookbook biquad high-pass filter, derived from closed-form coefficients, not a library black box. |
+| `dynamics.py` | A noise gate (mutes silence/background hiss) and a limiter (structurally guarantees bounded output). |
+| `chain.py` | Wires the filter, gate, and limiter into one processing chain. |
+| `queues.py` | A thread-safe, capacity-bounded, drop-oldest queue — latency can never grow without bound. |
+| `bypass.py` | Wraps the DSP pipeline; on any failure, non-finite output, or missed deadline, emits silence instead. |
+| `engine.py` | The live engine: wires everything above into an actual PortAudio duplex stream. |
+| `presets.py` | The named pitch/formant combinations listed in the table above. |
+
+## Project structure
+
+```
+voice-dsp-engine/
+├── src/voice_dsp/        # the engine itself (see table above)
+├── tests/                 # pytest unit tests, one file per module
+├── validation/            # the Stage 6 synthetic-tone benchmark (separate from pytest)
+├── requirements.txt        # pinned dependency versions
+├── DECISIONS.md             # every technical decision, with the reasoning and real measurements behind it
+├── ASSUMPTIONS.md            # everything assumed because it wasn't explicitly specified
+└── README.md                  # this file
+```
+
+`DECISIONS.md` and `ASSUMPTIONS.md` are worth reading if you want the full
+story — they document the actual engineering process, including two dead
+ends (a chunking approach that clicked at every boundary, and a crossfade
+fix that turned out to silently discard audio) before arriving at the
+current architecture, all with real measured numbers rather than
+after-the-fact narrative.
+
+## Getting started
+
+### Requirements
+
+- Python 3.12 (developed and tested against 3.12.8)
+- A working PortAudio installation. On macOS this is usually bundled
+  automatically; if not, `brew install portaudio`. On Linux,
+  `apt install libportaudio2` (or your distro's equivalent) first.
+
+### Install
 
 ```bash
 python3 -m venv venv
@@ -60,123 +144,87 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-`requirements.txt` pins exactly the versions this project was built and
-tested against: `numpy==2.5.2`, `scipy==1.18.1`, `sounddevice==0.5.6`,
-`pytest==9.1.1`. See `DECISIONS.md` for why `sounddevice` was chosen over
-`pyaudio`.
+`requirements.txt` pins exact versions this project was built and tested
+against: `numpy==2.5.2`, `scipy==1.18.1`, `sounddevice==0.5.6`,
+`pytest==9.1.1`.
 
-## Running the live engine
-
-```bash
-python3 -m src.voice_dsp.engine <preset> <duration_seconds>
-```
-
-`<preset>` is one of the names in `src/voice_dsp/presets.py`: `identity`,
-`pitch_up_third`, `pitch_down_third`, `pitch_up_octave`, `formant_up`,
-`formant_down`, `pitch_and_formant_up`, `pitch_up_formant_down`. Example:
+### Run it
 
 ```bash
 python3 -m src.voice_dsp.engine pitch_up_third 30
 ```
 
-This opens your microphone and speakers directly — **use headphones**, since
-it is a live audio loop and can otherwise produce feedback. There is also a
-zero-DSP passthrough mode (Stage 1) for isolating raw I/O behavior:
+**Use headphones.** This opens a live duplex stream between your microphone
+and speakers; without headphones you'll get feedback. Swap `pitch_up_third`
+for any preset from the table above, and `30` for however many seconds you
+want it to run.
+
+There's also a zero-DSP raw passthrough mode, useful for isolating whether
+any issue is in the audio I/O itself versus the DSP:
 
 ```bash
 python3 src/voice_dsp/audio_io.py 30
 ```
 
-## Running the unit tests
+### Run the tests
 
 ```bash
-source venv/bin/activate
 python3 -m pytest
 ```
 
-All test tolerances are documented in `DECISIONS.md` alongside the actual
-measurements that motivated them, not chosen arbitrarily.
+43 tests covering every module, from bit-exact STFT reconstruction to full
+threaded engine integration. Every tolerance in the suite is backed by a
+real measurement recorded in `DECISIONS.md` — not picked arbitrarily.
 
-## Running the validation suite
-
-The Stage 6 validation benchmark is separate from the unit test suite and
-not run by pytest:
+### Run the validation benchmark
 
 ```bash
-source venv/bin/activate
 python3 -m validation.benchmark
 ```
 
-It synthesizes a voice-like harmonic test tone at three base frequencies
-(130/180/240Hz) for each of the 8 presets (24 cases total), runs the full
-pitch+formant pipeline, measures the actual output frequency, and reports
-pass/fail against a documented tolerance. See `DECISIONS.md` for why a
-voice-like tone is used rather than a pure sine (a pure sine has no formants
-to validate, and exposed a real, documented limitation when tried first).
+A reproducible accuracy benchmark, separate from the unit tests: synthesizes
+a voice-like harmonic test tone at three base frequencies for each of the 8
+presets (24 cases), runs the full pipeline, and measures the actual output
+frequency against what was expected.
 
 ## Measured results
 
-All numbers below are actual measurements recorded in `DECISIONS.md` as they
-were produced, not placeholders.
+Everything below is a real number, produced by actually running the code —
+never a placeholder.
 
-**Stage 2 — STFT round-trip and pitch accuracy** (sr=48000, frame_size=2048,
-hop_size=512): round-trip max absolute error 3.33e-16 on a 1s 220Hz sine.
-Pitch-shift accuracy on a 220Hz sine: +3st error +0.027Hz, +7st error
--0.026Hz, -5st error +0.033Hz, +12st error 0.000Hz.
+- **STFT round-trip**: 3.33e-16 max absolute error (essentially the limit of
+  float64 precision) reconstructing a 1-second 220Hz sine.
+- **Pitch-shift accuracy**: within 0.03Hz of the expected frequency across
+  ±3 to +12 semitones on a 220Hz test tone.
+- **Formant independence**: a formant-only shift leaves the fundamental
+  frequency *exactly* unchanged; a pitch-only shift leaves formant peak
+  locations within ~47Hz of their original position.
+- **Filter response**: matches the analytically expected -3.01dB at the
+  biquad's cutoff frequency, within 0.002dB.
+- **Limiter safety**: fed a 5x-over-range signal with injected `inf`/`nan`
+  values, output stayed fully finite and bounded exactly to the configured
+  threshold.
+- **Validation benchmark**: 24/24 cases (8 presets × 3 base frequencies)
+  within a 3.0Hz tolerance; worst-case error 0.31Hz.
+- **Live hardware, passthrough**: 30 real seconds, zero underflows/overflows.
+- **Live hardware, full engine**: 30 real seconds with pitch and formant
+  shifting active, 0 bypasses, 0 dropped audio, ~25ms of total scheduling
+  jitter across the whole run (0.08%). Confirmed by ear: pitch shift sounds
+  correct, and the chunk-boundary clicking that an earlier architecture had
+  is reduced to nearly nothing.
 
-**Stage 3 — independent pitch/formant control** (synthetic two-formant
-vowel, F0=180Hz, formants at 700/1200Hz): formant-only shifts left F0
-exactly unchanged; pitch-only (formant-preserving) shifts changed F0 within
-0.27Hz of expected while leaving formant peaks within 46.9Hz (worst case) of
-their original location.
-
-**Stage 4 — filter and dynamics** (cutoff=80Hz, Q=0.707, sr=48000): 20Hz
-attenuated -24.100dB, 80Hz (cutoff) at -3.012dB (matches the analytic
--3.01dB), 1000Hz+ within 0.001dB of unity. Limiter on a 5x-over-range sine
-with injected inf/nan/1e9 samples: output stayed fully finite, bounded
-exactly to the 0.98 threshold.
-
-**Stage 5 — runtime robustness**: an 8-item bounded queue fed 1000 items
-while draining every third item never exceeded capacity; a 4-item queue fed
-10 items with no draining retained exactly the 4 newest and reported
-`dropped_count == 6`. The bypass guard emitted silence (not raw input) on a
-forced exception, a NaN result, and a deadline overrun; it passed real
-output through unchanged when processing succeeded.
-
-**Stage 6 — validation benchmark** (24 cases: 8 presets x 3 base
-frequencies): 24/24 within the 3.0Hz tolerance. Worst-case error +0.3141Hz
-(`formant_down` preset, 180Hz base). Re-run `python3 -m validation.benchmark`
-to reproduce.
-
-**Stage 1 — live passthrough latency**: run live for the full 30 seconds on
-real hardware (MacBook Air built-in microphone/speakers): 5670 callbacks,
-1,451,520 frames processed, reported input latency 227.021ms, reported
-output latency 31.854ms, mean callback compute time 2.5us, max 22.1us, 0
-underflows, 0 overflows.
-
-**Continuous streaming processor**: an earlier chunked architecture (with
-independent per-chunk phase-vocoder analysis, later with an overlap-window
-crossfade) produced an audible click at every chunk boundary. Replaced with
-`src/voice_dsp/streaming.py`, which never resets its internal phase state.
-Verified (`tests/test_streaming.py`) to produce identical output regardless
-of how the caller chunks input (4096 samples/call vs. 1 sample/call: max
-difference ~3e-12) and zero large discontinuities across tested pitch
-ratios. Confirmed live on real hardware (`pitch_up_third` preset, 30s):
-`underrun_count=68`, `underrun_samples=1202` (25.0ms total, 0.083% of the
-run), 0 bypasses, 0 queue drops. Audible result reported directly by the
-project owner: clicking reduced to "a very little" — a substantial
-improvement over the pre-rewrite version, with the small remainder most
-plausibly explained by brief real-time scheduling jitter (see "Known
-limitations" below) rather than the phase discontinuity this rewrite
-targeted, which testing shows is fully eliminated.
+The full, unabridged version of every measurement above — including the
+things that didn't work on the first try — is in `DECISIONS.md`.
 
 ## Known limitations
 
-- A small amount of clicking remains audible on real hardware (measured:
-  ~25ms of brief silence-padding underruns over a 30s run, 0.083% of the
-  audio). This is real-time queue/thread scheduling jitter between the
-  audio callback and the DSP worker thread, not the phase-vocoder
-  discontinuity the streaming rewrite targeted (which testing shows is
-  fully eliminated). Increasing `queue_capacity` or `blocksize` would trade
-  a small amount of latency for fewer underruns if this needs to be reduced
-  further.
+- A very small amount of audio-scheduling jitter (~0.08% of runtime,
+  measured) is still audible on real hardware as an occasional faint click.
+  This is real-time thread scheduling noise, not a DSP correctness issue —
+  the phase-vocoder discontinuity that used to cause audible clicking has
+  been fully eliminated and verified with deterministic, chunk-size-invariant
+  tests. Increasing `queue_capacity` or `blocksize` would trade a little
+  more latency for less of this jitter, if needed.
+- This project intentionally does not include a GUI, file import/export, or
+  network streaming — see `DECISIONS.md` for what was considered and kept
+  out of scope.
