@@ -156,9 +156,40 @@ Test suite (`tests/test_formant.py`) uses 2.0Hz F0 tolerance and 60Hz peak-locat
 
 ---
 
+### 2026-08-23 — Stage 6 benchmark debugging: pure-sine test signal exposed a real limitation, plus a measurement-methodology dead end
+
+**What happened:** The first version of the Stage 6 benchmark used pure sine test tones (matching the Stage 2 pitch-accuracy tests) across all 8 presets x 3 base frequencies. 5 of 24 cases failed badly (tens to hundreds of Hz off), all at larger pitch shifts (+7, +12 semitones).
+
+**Root cause, confirmed by direct isolation:** `formant.pitch_shift_formant_preserving()` always applies an inverse formant-envelope warp (via `shift_formants`) to cancel the frequency-axis scaling that resampling imposes on formants -- necessary and correctly verified for real (harmonic) voice signals in Stage 3. For a pure sine (a single spectral component), there is no real envelope/excitation structure to separate: cepstral "envelope" extraction on a single spectral line just produces a smoothed hump around that line, and warping+reapplying it does not correctly relocate a lone spectral peak the way it relocates a real multi-formant envelope over rich harmonic content. Confirmed directly: `pitch.pitch_shift()` (no formant correction) on a 220Hz sine at +12 semitones measured 440.000Hz (exact); `formant.process()` (with the correction) on the same input measured 252.5Hz (wrong). This is a genuine, narrow limitation of the cepstral source-filter decomposition on out-of-domain (non-harmonic) input, not a coding typo -- the technique assumes a harmonic excitation source, which a pure sine is not. It does not affect real voice input, which is always harmonically rich.
+
+**A second, unrelated dead end during debugging:** re-testing with a harmonic (voice-like) synthetic tone instead of a pure sine, initial autocorrelation-based F0 measurement still showed one spurious large error (240Hz base, +12 semitones: measured 390.24Hz vs expected 480Hz). Direct comparison of the processed output's spectrum against ground-truth synthesis at 480Hz showed the correct fundamental (480.47Hz) and harmonics *were* present and matched exactly -- the failure was in the measurement method, not the DSP: plain autocorrelation over a wide lag range is well known to suffer octave/spurious-peak errors on harmonic-rich signals, and this signal has some extra low-level artifact energy (see below) that a wide-open autocorrelation search picked up instead of the true periodicity.
+
+**Resolution:** The Stage 6 benchmark (`validation/benchmark.py`) uses a synthesized voice-like harmonic tone (impulse train through two resonant formant filters, same construction as `tests/test_formant.py`) rather than a pure sine -- appropriate since formant presets are not meaningfully testable on a signal with no formant structure in the first place -- and measures frequency via an FFT-magnitude peak search restricted to a band around the expected value (±12%) rather than global peak-picking or wide-range autocorrelation, which avoids both failure modes above without hiding a genuinely wrong result (if the pipeline actually shifted pitch outside that band, no strong peak would be found there).
+
+**Residual, documented artifact:** the isolated spectral comparison above also showed some extra low-level spectral content beyond the correct fundamental/harmonics in the pitch+formant-corrected output at certain parameter combinations (e.g. a spurious component near 187Hz for the 240Hz-base/+12-semitone/no-formant-shift case) that is not present in ground-truth direct synthesis at the target frequency. The fundamental frequency itself was confirmed correct in every case tested; this residual content is consistent with known phase-vocoder "phasiness" artifacts at large stretch ratios and is a spectral-quality limitation, not a pitch-accuracy one. Not fixed further given time constraints; recorded here rather than silently left undocumented.
+
+**Stage:** Stage 6.
+
+---
+
+### 2026-08-23 — Stage 6 validation results
+
+**Decision/record:** Ran `validation/benchmark.py` (synthesized voice-like harmonic test tone, 3 base frequencies x 8 presets = 24 cases, FFT-peak-in-band frequency measurement -- see benchmark debugging entry above for why). All 24/24 cases passed the 3.0Hz tolerance. Worst-case error: +0.3141Hz (`formant_down` preset, 180Hz base). Full per-case table is reproducible by re-running `python3 -m validation.benchmark`; representative rows:
+
+- identity (0st/0st): 130Hz base -> expected 130.000, measured 129.755, err -0.245Hz
+- pitch_up_third (+4st/0st): 240Hz base -> expected 302.381, measured 302.642, err +0.261Hz
+- pitch_up_octave (+12st/0st): 480Hz base -> expected 480.000, measured 480.138, err +0.138Hz
+- pitch_and_formant_up (+5st/+3st): 180Hz base -> expected 240.271, measured 240.266, err -0.005Hz
+- pitch_up_formant_down (+7st/-3st): 180Hz base -> expected 269.695, measured 269.689, err -0.007Hz
+
+**Stage:** Stage 6.
+
+---
+
 ### 2026-08-23 — Considered but out of scope
 
 - **Fully continuous-phase streaming phase vocoder** (incremental STFT with a persistent per-bin synthesis-phase accumulator across the whole session, rather than independent per-chunk processing) — would remove the chunk-boundary discontinuity described above and reduce latency. Left as a documented future improvement rather than implemented now, per the chunked-worker-thread tradeoff above.
+- **Robust formant-envelope correction for non-harmonic (e.g. pure-tone) input** — the cepstral source-filter separation `pitch_shift_formant_preserving` relies on is not well-defined for signals without real harmonic structure (see the Stage 6 benchmark-debugging entry above). A more robust approach (e.g. detecting spectral sparsity/harmonicity and reducing or skipping the envelope correction accordingly) was not implemented, since real voice input is always harmonically rich and this only manifests on synthetic pure-tone test signals, not the engine's actual use case.
 
 ---
 
