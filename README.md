@@ -56,7 +56,7 @@ change the apparent size of the speaker *without* changing the note.
   anything in the pipeline breaks or falls behind.
 - **Backed by real measurements, not vibes**: every tolerance in the test
   suite and every claim in this README traces back to an actual number,
-  recorded as it was produced, in `DECISIONS.md`.
+  recorded as it was produced.
 
 ## How it works
 
@@ -115,17 +115,8 @@ voice-dsp-engine/
 ├── tests/                 # pytest unit tests, one file per module
 ├── validation/            # the Stage 6 synthetic-tone benchmark (separate from pytest)
 ├── requirements.txt        # pinned dependency versions
-├── DECISIONS.md             # every technical decision, with the reasoning and real measurements behind it
-├── ASSUMPTIONS.md            # everything assumed because it wasn't explicitly specified
-└── README.md                  # this file
+└── README.md               # this file
 ```
-
-`DECISIONS.md` and `ASSUMPTIONS.md` are worth reading if you want the full
-story: they document the actual engineering process, including two dead
-ends (a chunking approach that clicked at every boundary, and a crossfade
-fix that turned out to silently discard audio) before arriving at the
-current architecture, all with real measured numbers rather than
-after-the-fact narrative.
 
 ## Getting started
 
@@ -174,7 +165,7 @@ python3 -m pytest
 
 43 tests covering every module, from bit-exact STFT reconstruction to full
 threaded engine integration. Every tolerance in the suite is backed by a
-real measurement recorded in `DECISIONS.md`, not picked arbitrarily.
+real measurement, not picked arbitrarily.
 
 ### Run the validation benchmark
 
@@ -213,9 +204,6 @@ never a placeholder.
   correct, and the chunk-boundary clicking that an earlier architecture had
   is reduced to nearly nothing.
 
-The full, unabridged version of every measurement above, including the
-things that didn't work on the first try, is in `DECISIONS.md`.
-
 ## Known limitations
 
 - A very small amount of audio-scheduling jitter (~0.08% of runtime,
@@ -226,5 +214,4 @@ things that didn't work on the first try, is in `DECISIONS.md`.
   tests. Increasing `queue_capacity` or `blocksize` would trade a little
   more latency for less of this jitter, if needed.
 - This project intentionally does not include a GUI, file import/export, or
-  network streaming. See `DECISIONS.md` for what was considered and kept
-  out of scope.
+  network streaming.
